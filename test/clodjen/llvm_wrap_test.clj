@@ -20,7 +20,7 @@
 (deftest simple-func
   (test-func "Define and execute a simple function"
              "fac" :i32 [:i32]
-             [entry (let [eq  (cmp (params 0) (const (types :i32) 1) :eq)
+             [entry (let [eq  (cmp (params 0) [:i32 1] :eq)
                                             res (int-cast eq (types :i32))]
                                         (ret res))]
              "; ModuleID = 'fac_module'
@@ -55,13 +55,13 @@ entry:
 (deftest branching-func
   (test-func "Define and execute a branching func"
              "over21" :i1 [:i32]
-             [entry (let [over (cmp (params 0) (const (types :i32) 21) :gt)]
+             [entry (let [over (cmp (params 0) [:i32 21] :gt)]
                       (cond-branch over then else))
               then (branch done)
               else (branch done)
               done (let [res (make-phi (types :i1) "res")]
                      (phi-incoming res
-                                   [(const (types :i1) 1) (const (types :i1) 0)]
+                                   [(const :i1 1) (const :i1 0)]
                                    [then else])
                      (ret res))]
              "; ModuleID = 'over21_module'

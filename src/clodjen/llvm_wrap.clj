@@ -1,4 +1,5 @@
-(ns clodjen.llvm-wrap)
+(ns clodjen.llvm-wrap
+  (:require [clodjen.utils :refer [extract-arg-meta]]))
 
 (import '[org.bytedeco.javacpp Pointer PointerPointer BytePointer FunctionPointer])
 (import '[org.bytedeco.llvm.LLVM LLVMModuleRef LLVMTypeRef LLVMValueRef
@@ -68,7 +69,22 @@
                 defs)
          `(LLVM/LLVMDisposeBuilder builder)))))
 
-(defn const [type value] (LLVM/LLVMConstInt type value 1))
+(defmacro defllvm [fn-name args body]
+  (let [patch-value-sym (gensym)]
+    `(defn ~fn-name [~@args]
+       (let [~patch-value-sym (fn [arg#]
+                            (cond
+                              (instance? LLVMValueRef arg#) arg#
+                              (= 2 (count arg#))            (apply const arg#)
+                              :default                      (throw (Exception. (str "Value arg " arg# " should be either LLVMValueRef or a (type const) tuple")))))
+             ~@(apply concat (for [arg  args
+                              :when (:value (meta arg))]
+                          `[~arg (~patch-value-sym ~arg)]))]
+         ~body))))
+
+(defn const [type value]
+  (let [llvm-type (if (instance? LLVMTypeRef type) type (types type))]
+    (LLVM/LLVMConstInt llvm-type value 1)))
 
 (defn make-phi [type name]
   (LLVM/LLVMBuildPhi builder type name))
@@ -84,25 +100,24 @@
   (let [args-arr (into-array LLVMValueRef args)]
     (LLVM/LLVMBuildCall builder func (PointerPointer. args-arr) (count args) "call")))
 
-(defn mul [val1 val2]
-  (LLVM/LLVMBuildMul builder val1 val2 "mul"))
+(defllvm mul [^:value val1 ^:value val2]
+    (LLVM/LLVMBuildMul builder val1 val2 "mul"))
 
-(defn add [val1 val2]
+(defllvm add [^:value val1 ^:value val2]
   (LLVM/LLVMBuildAdd builder val1 val2 "add"))
 
-(defn sub [val1 val2]
+(defllvm sub [val1 val2]
   (LLVM/LLVMBuildSub builder val1 val2 "sub"))
 
-(defn cmp
-  ([val1 val2 op] (cmp val1 val2 op ""))
-  ([val1 val2 op comment]
-           (let [llvm-op (case op
-                           :eq LLVM/LLVMIntEQ
-                           :lt LLVM/LLVMIntSLT
-                           :le LLVM/LLVMIntSLE
-                           :ge LLVM/LLVMIntSGE
-                           :gt LLVM/LLVMIntSGT)]
-             (LLVM/LLVMBuildICmp builder llvm-op val1 val2 comment))))
+(defllvm cmp
+  [^:value val1 ^:value val2 op]
+  (let [llvm-op (case op
+                  :eq LLVM/LLVMIntEQ
+                  :lt LLVM/LLVMIntSLT
+                  :le LLVM/LLVMIntSLE
+                  :ge LLVM/LLVMIntSGE
+                  :gt LLVM/LLVMIntSGT)]
+    (LLVM/LLVMBuildICmp builder llvm-op val1 val2 "")))
 
 (defn int-cast
   ([value type] (int-cast value type ""))
@@ -200,3 +215,8 @@
 (def engine (make-execution-engine module))
 
 (print-module module)
+
+(defn test [^:i32 a]
+  (meta test))
+
+(map meta (first ((meta #'test) :arglists)))
