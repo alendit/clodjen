@@ -55,36 +55,98 @@
     (LLVM/LLVMSetFunctionCallConv func LLVM/LLVMCCallConv)
     {:func func :args arg-types :ret ret-type :name fn-name :module module}))
 
-(def ^:dynamic builder)
+(declare ^:dynamic builder)
+(declare ^:dynamic blocks-map)
+(declare ^:dynamic current-block)
+
+(count (filter {:i1 true} (keys types*)))
+
+(defn type-from-meta [sym]
+  (if-let [sym-meta (meta sym)]
+    (let [matched-types (filter sym-meta (keys types*))]
+        (case (count matched-types)
+          0 (throw (Exception. (str "No type was supplied for the block argument " sym)))
+          1 nil
+          (throw (Exception. (str "Multiple types supplied for the block argument " sym))))
+        `(types ~(first matched-types)))
+    (throw (Exception. (str "No type was supplied for the block argument " sym)))))
+
+(name :asdf)
+
+(defn initialize-block [block]
+  `(let [block-llvm# (LLVM/LLVMAppendBasicBlock ~'self ~(name (:name block)))]
+    (LLVM/LLVMPositionBuilderAtEnd builder block-llvm#)
+    (let [phis# ~(into {} (for [arg (:args block)]
+                            `[~(keyword arg) (LLVM/LLVMBuildPhi builder ~(type-from-meta arg) ~(str arg))]))]
+      {:name ~(:name block) :llvm block-llvm# :phis phis#})))
 
 (defmacro define-function [func bblocks]
-  (let [defs (partition 2 bblocks)]
+  (let [block-to-map #(zipmap [:name :args :vars :term] %)
+        blocks        (map block-to-map bblocks)]
     `(binding [builder (LLVM/LLVMCreateBuilder)]
-       (let [~'func (:func ~func)
-             ~'params (get-params ~func)
-             ~@(apply concat (map #(vector (first %1) `(LLVM/LLVMAppendBasicBlock ~'func ~(str (first %1)))) defs))]
-         ~@(map (fn [block-def]
-                  `(do (LLVM/LLVMPositionBuilderAtEnd builder ~(first block-def))
-                       ~(second block-def)))
-                defs)
+       (let [~'self (:func ~func)
+             ~'params   (get-params ~func)
+             ~'blocks-map ~(into {}
+                      (for [block blocks]
+                        [(:name block) (initialize-block block)]))]
+         (binding [blocks-map ~'blocks-map]
+           ~@(let [block-info-sym (gensym)]
+                 (for [block blocks]
+                   `(let [block-name#     ~(keyword (:name block))
+                          ~block-info-sym (block-name# blocks-map)
+                          block-llvm#     (:llvm ~block-info-sym)]
+                      (binding [current-block ~block-info-sym]
+                                (LLVM/LLVMPositionBuilderAtEnd builder block-llvm#)
+                                (let
+                                    [~@(apply concat (for [arg-name (:args block)]
+                                                       [(symbol arg-name) `(~(keyword arg-name) (:phis ~block-info-sym))]))
+                                     ~@(apply concat (for [defs (partition 2 (:vars block))
+                                                           :let [[name form] defs]]
+                                                       [name (concat form [(str name)])]))]
+                                  ~(:term block)))))))
          `(LLVM/LLVMDisposeBuilder builder)))))
-
-(defmacro defllvm [fn-name args body]
-  (let [patch-value-sym (gensym)]
-    `(defn ~fn-name [~@args]
-       (let [~patch-value-sym (fn [arg#]
-                            (cond
-                              (instance? LLVMValueRef arg#) arg#
-                              (= 2 (count arg#))            (apply const arg#)
-                              :default                      (throw (Exception. (str "Value arg " arg# " should be either LLVMValueRef or a (type const) tuple")))))
-             ~@(apply concat (for [arg  args
-                              :when (:value (meta arg))]
-                          `[~arg (~patch-value-sym ~arg)]))]
-         ~body))))
-
 (defn const [type value]
   (let [llvm-type (if (instance? LLVMTypeRef type) type (types type))]
     (LLVM/LLVMConstInt llvm-type value 1)))
+
+(defn make-llvm-value [arg]
+  (cond
+    (instance? LLVMValueRef arg)           arg
+    (and (seqable? arg) (= 2 (count arg))) (apply const arg)
+    :default                               (throw (Exception. (str "Value arg " arg " should be either LLVMValueRef or a (type const) tuple")))))
+
+
+
+(defn bind-phis [block args]
+  (doseq [[phi val] (map vector (vals (:phis (block blocks-map))) args)]
+    (LLVM/LLVMAddIncoming phi (make-llvm-value val) (:llvm current-block) 1)))
+
+(defn branch [target & args]
+  (let [block-info (target blocks-map)]
+    (bind-phis target args)
+    (LLVM/LLVMBuildBr builder (:llvm block-info))))
+
+(defn cond-branch [cond [block-1 & args-1] [block-2 & args-2]]
+  (do
+    (bind-phis block-1 args-1)
+    (bind-phis block-2 args-2)
+    (let [get-block-llvm #(:llvm (% blocks-map))]
+      (LLVM/LLVMBuildCondBr builder cond (get-block-llvm block-1) (get-block-llvm block-2)))))
+
+
+(defmacro resolve-local-symbol [sym]
+  (if-let [binding ((symbol sym) &env)]
+    (symbol sym)
+    'nil))
+
+
+(defmacro defllvm [fn-name args body]
+  (let [patch-value-sym (gensym)]
+    `(defn ~fn-name [~@args ~'op-name]
+       (let [~@(apply concat (for [arg  args
+                              :when (:value (meta arg))]
+                          `[~arg (make-llvm-value ~arg)]))]
+         ~body))))
 
 (defn make-phi [type name]
   (LLVM/LLVMBuildPhi builder type name))
@@ -101,13 +163,13 @@
     (LLVM/LLVMBuildCall builder func (PointerPointer. args-arr) (count args) "call")))
 
 (defllvm mul [^:value val1 ^:value val2]
-    (LLVM/LLVMBuildMul builder val1 val2 "mul"))
+    (LLVM/LLVMBuildMul builder val1 val2 op-name))
 
 (defllvm add [^:value val1 ^:value val2]
-  (LLVM/LLVMBuildAdd builder val1 val2 "add"))
+  (LLVM/LLVMBuildAdd builder val1 val2 op-name))
 
 (defllvm sub [val1 val2]
-  (LLVM/LLVMBuildSub builder val1 val2 "sub"))
+  (LLVM/LLVMBuildSub builder val1 val2 op-name))
 
 (defllvm cmp
   [^:value val1 ^:value val2 op]
@@ -117,19 +179,15 @@
                   :le LLVM/LLVMIntSLE
                   :ge LLVM/LLVMIntSGE
                   :gt LLVM/LLVMIntSGT)]
-    (LLVM/LLVMBuildICmp builder llvm-op val1 val2 "")))
+    (LLVM/LLVMBuildICmp builder llvm-op val1 val2 op-name)))
 
 (defn int-cast
   ([value type] (int-cast value type ""))
   ([value type comment] (LLVM/LLVMBuildIntCast builder value type comment)))
 
-(defn cond-branch [cond block-1 block-2]
-  (LLVM/LLVMBuildCondBr builder cond block-1 block-2))
-
-(defn branch [target]
-  (LLVM/LLVMBuildBr builder target))
-
-(defn ret [val] (LLVM/LLVMBuildRet builder val))
+(defn ret [val]
+  (let [llvm-val (make-llvm-value val)]
+    (LLVM/LLVMBuildRet builder val)))
 
 (defn get-param [func idx] (LLVM/LLVMGetParam (:func func) idx))
 
@@ -152,7 +210,7 @@
     (let [error-str (.getString error)]
       (LLVM/LLVMDisposeMessage error)
       (if (not (empty? error-str))
-        (throw (Exception. (str "Module verify failed with: "error-str)))))))
+        (throw (Exception. (str "Module verify failed with: " error-str ", in module " (print-module mod))))))))
 
 (defn print-module [mod]
   (let [buf (LLVM/LLVMPrintModuleToString mod)
@@ -160,16 +218,20 @@
     (LLVM/LLVMDisposeMessage buf)
     s))
 
-(defn make-execution-engine [mod]
-  (let [engine (LLVMExecutionEngineRef.)
-        error (BytePointer. (cast Pointer nil))
-        mod-result (LLVM/LLVMCreateJITCompilerForModule engine mod 2 error)]
-    (if (not= mod-result 0)
-      (do
-        (println (.getString error))
-        (LLVM/LLVMDisposeMessage error)
-        (System/exit -1))
-      engine)))
+(defn make-execution-engine
+  ([mod] (make-execution-engine mod true))
+  ([mod verify]
+   (do
+     (when verify (verify-module mod))
+     (let [engine     (LLVMExecutionEngineRef.)
+           error      (BytePointer. (cast Pointer nil))
+           mod-result (LLVM/LLVMCreateJITCompilerForModule engine mod 2 error)]
+       (if (not= mod-result 0)
+         (do
+           (println (.getString error))
+           (LLVM/LLVMDisposeMessage error)
+           (System/exit -1))
+         engine)))))
 
 (defn dispose-execution-engine [engine]
   (LLVM/LLVMDisposeExecutionEngine engine))
@@ -205,18 +267,39 @@
 ;; ()
 
 ;; (defn )
-(def module (create-module "add_module"))
-(def fadd   (declare-function module "add" :i32 [:i32 :i32]))
-(define-function fadd [entry (let [p1  (params 0)
-                                   p2  (params 1)
-                                   sum (add p1 p2)]
-                               (ret sum))])
+;; (def module (create-module "add_module"))
+;; (def fadd   (declare-function module "add" :i32 [:i32 :i32]))
+;; (define-function fadd [entry (let [p1  (params 0)
+;;                                    p2  (params 1)
+;;                                    sum (add p1 p2)]
+;;                                (ret sum))])
 
-(def engine (make-execution-engine module))
+;; (def engine (make-execution-engine module))
 
-(print-module module)
+;; (print-module module)
 
-(defn test [^:i32 a]
-  (meta test))
+;; (defn test [^:i32 a]
+;;   (meta test))
 
-(map meta (first ((meta #'test) :arglists)))
+;; (map meta (first ((meta #'test) :arglists)))
+
+(def mod (create-module "mod"))
+(def func (declare-function mod "func" :i32 [:i32]))
+(define-function func
+  [;;[entry [] [] (branch :then)]
+   [:entry [] [[p0 p1] params
+                 sum     (add p0 p1)]
+      (ret sum)]
+   ;; [:entry [] [over21 (cmp (params 0) [:i32 21] :gt)] (cond-branch over21 [:then] [:else])]
+   ;; [:then [] [] (branch :done [:i32 1])]
+   ;; [:else [] [] (branch :done [:i32 0])]
+   ;; [:done [^:i32 res] [sum (add res [:i32 1])] (ret sum)]]
+  ])
+
+(println (print-module mod))
+
+(verify-module mod)
+
+(def engine (make-execution-engine mod))
+
+(run-function engine func 22)

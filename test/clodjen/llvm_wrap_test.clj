@@ -20,17 +20,17 @@
 (deftest simple-func
   (test-func "Define and execute a simple function"
              "fac" :i32 [:i32]
-             [entry (let [eq  (cmp (params 0) [:i32 1] :eq)
-                                            res (int-cast eq (types :i32))]
-                                        (ret res))]
+             [[:entry [] [eq (cmp (params 0) [:i32 1] :eq)
+                         res (int-cast eq (types :i32))]
+               (ret res)]]
              "; ModuleID = 'fac_module'
 source_filename = \"fac_module\"
 
 define i32 @fac(i32) {
 entry:
-  %1 = icmp eq i32 %0, 1
-  %2 = sext i1 %1 to i32
-  ret i32 %2
+  %eq = icmp eq i32 %0, 1
+  %res = sext i1 %eq to i32
+  ret i32 %res
 }"
              [(is (= 0 (func 0)))
               (is (= -1 (func 1)))]))
@@ -38,9 +38,10 @@ entry:
 (deftest add-func
   (test-func "Define and execute an adder func"
              "add" :i32 [:i32 :i32]
-             [entry (let [[p0 p1] params
-                          sum (add p0 p1)]
-                      (ret sum))]
+             [[:entry [] [p0 (params 0)
+                          p1 (params 1)
+                          sum     (add p0 p1)]
+               (ret sum)]]
              "; ModuleID = 'add_module'
 source_filename = \"add_module\"
 
@@ -55,22 +56,19 @@ entry:
 (deftest branching-func
   (test-func "Define and execute a branching func"
              "over21" :i1 [:i32]
-             [entry (let [over (cmp (params 0) [:i32 21] :gt)]
-                      (cond-branch over then else))
-              then (branch done)
-              else (branch done)
-              done (let [res (make-phi (types :i1) "res")]
-                     (phi-incoming res
-                                   [(const :i1 1) (const :i1 0)]
-                                   [then else])
-                     (ret res))]
+             [[:entry []
+               [over (cmp (params 0) [:i32 21] :gt)]
+               (cond-branch over [:then] [:else])]
+              [:then [] [] (branch :done [:i1 1])]
+              [:else [] [] (branch :done [:i1 0])]
+              [:done [^:i1 res] [] (ret res)]]
              "; ModuleID = 'over21_module'
 source_filename = \"over21_module\"
 
 define i1 @over21(i32) {
 entry:
-  %1 = icmp sgt i32 %0, 21
-  br i1 %1, label %then, label %else
+  %over = icmp sgt i32 %0, 21
+  br i1 %over, label %then, label %else
 
 then:                                             ; preds = %entry
   br label %done
@@ -84,3 +82,8 @@ done:                                             ; preds = %else, %then
 }"
              [(is (= true (func 22)))
               (is (= false (func 20)))]))
+
+;; (deftest branching-func-args
+;;   (test-func "Define and execute a branching func with block args"
+;;              "over21" :i1 [:i32]
+;;              [[entry (let [over (cmp (params 0) [:i32 21] :gt)])]]))
