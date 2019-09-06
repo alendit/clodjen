@@ -182,7 +182,7 @@
 
 (defn branch
   "Branch to the target block (given by keyword) and pass it the arguments"
-  [target & args]
+  [target args]
   (let [block-info (target blocks-map)]
     (bind-phis target args)
     (LLVM/LLVMBuildBr builder (:llvm block-info))))
@@ -190,7 +190,7 @@
 
 (defn cond-branch
   "Conditionally branch to either block 1 or 2 and give them the provided arguments"
-  [cond [block-1 & args-1] [block-2 & args-2]]
+  [cond block-1  args-1 block-2 args-2]
   (do
     (bind-phis block-1 args-1)
     (bind-phis block-2 args-2)

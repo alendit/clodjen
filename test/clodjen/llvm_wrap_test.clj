@@ -38,9 +38,9 @@
              "over21" :i1 [^:i32 score]
              [[:entry []
                [over (cmp score [:i32 21] :gt)]
-               (cond-branch over [:then] [:else])]
-              [:then [] [] (branch :done [:i1 1])]
-              [:else [] [] (branch :done [:i1 0])]
+               (cond-branch over :then [] :else [])]
+              [:then [] [] (branch :done [[:i1 1]])]
+              [:else [] [] (branch :done [[:i1 0]])]
               [:done [^:i1 res] [] (ret res)]]
              [(is (= true (func 22)))
               (is (= false (func 20)))]))
@@ -51,13 +51,13 @@
              [[:entry
                []
                [break (cmp x [:i64 1] :lt)]
-               (cond-branch break [:ret [:i64 1]] [:cont x])]
+               (cond-branch break :ret [[:i64 1]] :cont [x])]
               [:cont
                [^:i64 y]
                [y-next (sub y [:i64 1])
                 res-next (call-func self [y-next])
                 res-mul  (mul res-next y)]
-               (branch :ret res-mul)]
+               (branch :ret [res-mul])]
               [:ret [^:i64 res] [] (ret res)]]
              [(is (= 1 (func 0)))
               (is (= 1 (func 1)))
@@ -70,13 +70,13 @@
              [[:entry
                []
                []
-               (branch :loop x [:i64 1])]
+               (branch :loop [x [:i64 1]])]
               [:loop
                [^:i64 idx ^:i64 acc]
                [stop? (cmp idx [:i64 1] :le)
                 new-acc (mul acc idx)
                 new-idx (sub idx [:i64 1])]
-               (cond-branch stop? [:break acc] [:loop new-idx new-acc])]
+               (cond-branch stop? :break [acc] :loop [new-idx new-acc])]
               [:break
                [^:i64 res]
                []
