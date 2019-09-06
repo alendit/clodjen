@@ -13,7 +13,7 @@
       (verify-module module#)
       ;; (is (= ~expected-llvm (trim-module module#)))
       (let [engine# (make-execution-engine module#)
-            ~'func (fn [& args#] (apply run-function engine# func-ref# args#))]
+            ~'func (fn [& args#] (run-function engine# func-ref# args#))]
         ~@test-cases))))
 
 (deftest simple-func
