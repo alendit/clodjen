@@ -64,7 +64,8 @@
               (is (= 6 (func 3)))
               (is (= 3628800 (func 10)))]))
 
-;; (deftest branching-func-args
-;;   (test-func "Define and execute a branching func with block args"
-;;              "over21" :i1 [:i32]
-;;              [[entry (let [over (cmp (params 0) [:i32 21] :gt)])]]))
+(deftest dividing-func
+  (test-func "Simple float divider"
+             "divide" :d [^:d x ^:d y]
+             [[:entry [] [res (fdiv x y)] (ret res)]]
+             [(is (= 5. (func 10. 2.)))]))

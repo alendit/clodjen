@@ -24,7 +24,9 @@
 ;; define integer types
 (def types* (let [int-sizes [1 8 16 32 64 128]
                  int-type* #(symbol (str "LLVM/LLVMInt" % "Type"))
-                 defs      (map (fn [x] [(keyword (str "i" x)) (eval `(~(int-type* x)))]) int-sizes)]
+                  int-defs      (map (fn [x] [(keyword (str "i" x)) (eval `(~(int-type* x)))]) int-sizes)
+                  float-defs {:f (LLVM/LLVMFloatType) :d (LLVM/LLVMDoubleType)}
+                  defs (merge int-defs float-defs)]
               (into {} defs)))
 
 (defn throwing-map [initial-map]
@@ -37,11 +39,19 @@
 
 (def llvm-types (-> types* clojure.set/map-invert throwing-map))
 
-(def c-types {:i1   Boolean
+(def c-types {:i1  Boolean
               :i8  Byte
               :i16 Short
               :i32 Integer
-              :i64  Long })
+              :i64 Long
+              :f   Float
+              :d   Double})
+
+(defn int-type? [type]
+  (boolean (#{:i1 :i8 :i16 :i32 :i64} type)))
+
+(defn float-type? [type]
+  (boolean (#{:d :f} type)))
 
 (into {} (for [x [1 2 3]]
            [x (* 2 x)]))
@@ -68,11 +78,6 @@
 (declare ^:dynamic builder)
 (declare ^:dynamic blocks-map)
 (declare ^:dynamic current-block)
-
-(count (filter {:i1 true} (keys types*)))
-
-
-(name :asdf)
 
 (defn initialize-block [block]
   `(let [block-llvm# (LLVM/LLVMAppendBasicBlock ~'self ~(name (:name block)))]
@@ -111,8 +116,12 @@
          ~func-info-sym))))
 
 (defn const [type value]
-  (let [llvm-type (if (instance? LLVMTypeRef type) type (types type))]
-    (LLVM/LLVMConstInt llvm-type value 1)))
+  (let [cl-type (if (instance? LLVMTypeRef type) (c-types type) type)
+        llvm-type (types cl-type)]
+    (cond
+      (int-type? cl-type) (LLVM/LLVMConstInt llvm-type value 1)
+      (= (float-type?) cl-type) (LLVM/LLVMConstReal llvm-type value)
+      :default (throw (Exception. "Invalid type " type)))))
 
 (defn make-llvm-value [arg]
   (cond
@@ -136,12 +145,6 @@
     (bind-phis block-2 args-2)
     (let [get-block-llvm #(:llvm (% blocks-map))]
       (LLVM/LLVMBuildCondBr builder cond (get-block-llvm block-1) (get-block-llvm block-2)))))
-
-
-(defmacro resolve-local-symbol [sym]
-  (if-let [binding ((symbol sym) &env)]
-    (symbol sym)
-    'nil))
 
 
 (defmacro defllvm [fn-name args body]
@@ -174,6 +177,9 @@
 
 (defllvm sub [^:value val1 ^:value val2]
   (LLVM/LLVMBuildSub builder val1 val2 op-name))
+
+(defllvm fdiv [^:value val1 ^:value val2]
+  (LLVM/LLVMBuildFDiv builder val1 val2 op-name))
 
 (defllvm cmp
   [^:value val1 ^:value val2 op]
@@ -280,20 +286,3 @@
 (def engine (make-execution-engine mod))
 
 (run-function engine fac 10)
-
-;; (def func (define-function mod "func" :i32 [^:i32 x]
-;;             [
-;;              [:entry [] [over21 (cmp x [:i32 21] :gt)] (cond-branch over21 [:then] [:else])]
-;;              [:then [] [] (branch :done [:i32 1])]
-;;              [:else [] [] (branch :done [:i32 0])]
-;;              [:done [^:i32 res] [sum (add res [:i32 1])] (ret sum)]]))
-
-
-
-;; (println (print-module mod))
-
-;; (verify-module mod)
-
-;;
-
-;; (run-function engine func 22)
