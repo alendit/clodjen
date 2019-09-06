@@ -45,6 +45,25 @@
              [(is (= true (func 22)))
               (is (= false (func 20)))]))
 
+(deftest factorial-func
+  (test-func "Define a recursive factorial function"
+             "factorial" :i64 [^:i64 x]
+             [[:entry
+               []
+               [break (cmp x [:i64 1] :lt)]
+               (cond-branch break [:ret [:i64 1]] [:cont x])]
+              [:cont
+               [^:i64 y]
+               [y-next (sub y [:i64 1])
+                res-next (call-func self [y-next])
+                res-mul  (mul res-next y)]
+               (branch :ret res-mul)]
+              [:ret [^:i64 res] [] (ret res)]]
+             [(is (= 1 (func 0)))
+              (is (= 1 (func 1)))
+              (is (= 6 (func 3)))
+              (is (= 3628800 (func 10)))]))
+
 ;; (deftest branching-func-args
 ;;   (test-func "Define and execute a branching func with block args"
 ;;              "over21" :i1 [:i32]

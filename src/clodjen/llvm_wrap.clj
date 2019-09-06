@@ -162,9 +162,9 @@
         block-arr (into-array LLVMBasicBlockRef blocks)]
     (LLVM/LLVMAddIncoming phi (PointerPointer. values-arr) (PointerPointer. block-arr) (count values))))
 
-(defn call-func [func & args]
+(defllvm call-func [func args]
   (let [args-arr (into-array LLVMValueRef args)]
-    (LLVM/LLVMBuildCall builder func (PointerPointer. args-arr) (count args) "call")))
+    (LLVM/LLVMBuildCall builder func (PointerPointer. args-arr) (count args) op-name)))
 
 (defllvm mul [^:value val1 ^:value val2]
     (LLVM/LLVMBuildMul builder val1 val2 op-name))
@@ -172,7 +172,7 @@
 (defllvm add [^:value val1 ^:value val2]
   (LLVM/LLVMBuildAdd builder val1 val2 op-name))
 
-(defllvm sub [val1 val2]
+(defllvm sub [^:value val1 ^:value val2]
   (LLVM/LLVMBuildSub builder val1 val2 op-name))
 
 (defllvm cmp
@@ -258,7 +258,29 @@
 
 
 
-;; (def mod (create-module "mod"))
+(def mod (create-module "mod"))
+(def fac
+  (define-function mod "fac" :i64 [^:i64 x]
+    [[:entry
+      []
+      [break (cmp x [:i64 1] :lt)]
+      (cond-branch break [:ret [:i64 1]] [:cont x])]
+     [:cont
+      [^:i64 y]
+      [y-next (sub y [:i64 1])
+       res-next (call-func self [y-next])
+       res-mul  (mul res-next y)]
+      (branch :ret res-mul)]
+     [:ret [^:i64 res] [] (ret res)]]))
+
+(println (print-module mod))
+
+(verify-module mod)
+
+(def engine (make-execution-engine mod))
+
+(run-function engine fac 10)
+
 ;; (def func (define-function mod "func" :i32 [^:i32 x]
 ;;             [
 ;;              [:entry [] [over21 (cmp x [:i32 21] :gt)] (cond-branch over21 [:then] [:else])]
@@ -272,6 +294,6 @@
 
 ;; (verify-module mod)
 
-;; (def engine (make-execution-engine mod))
+;;
 
 ;; (run-function engine func 22)
