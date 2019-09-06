@@ -64,6 +64,28 @@
               (is (= 6 (func 3)))
               (is (= 3628800 (func 10)))]))
 
+(deftest factorial-looping-func
+  (test-func "Like factorial but without recursion"
+             "factorial" :i64 [^:i64 x]
+             [[:entry
+               []
+               []
+               (branch :loop x [:i64 1])]
+              [:loop
+               [^:i64 idx ^:i64 acc]
+               [stop? (cmp idx [:i64 1] :le)
+                new-acc (mul acc idx)
+                new-idx (sub idx [:i64 1])]
+               (cond-branch stop? [:break acc] [:loop new-idx new-acc])]
+              [:break
+               [^:i64 res]
+               []
+               (ret res)]]
+             [(is (= 1 (func 0)))
+              (is (= 1 (func 1)))
+              (is (= 6 (func 3)))
+              (is (= 3628800 (func 10)))]))
+
 (deftest dividing-func
   (test-func "Simple float divider"
              "divide" :d [^:d x ^:d y]
