@@ -34,12 +34,28 @@
   (LLVM/LLVMModuleCreateWithName name))
 
 ;; ## Type definitions
-;; Define types
-(def types* (let [int-sizes [1 8 16 32 64 128]
-                 int-type* #(symbol (str "LLVM/LLVMInt" % "Type"))
-                  int-defs      (map (fn [x] [(keyword (str "i" x)) (eval `(~(int-type* x)))]) int-sizes)
-                  float-defs {:f (LLVM/LLVMFloatType) :d (LLVM/LLVMDoubleType)}
-                  defs (merge int-defs float-defs)]
+
+;; clodjen has two kinds of types: clojure type (abbreviated cl-type) and llvm-type
+;; Since clodjen's type systems is more expressive than LLVM's, a llvm type can't be
+;; losslessly converted to  the cl-type.
+
+;; Clojure types containing type tag (i.e. :i8, :p, :a), content for complex
+;; types and reference to the llvm  type
+(defrecord cl-type [tag llvm content])
+
+(defn make-cl-type
+  "Constructor for a cl type"
+  ([tag llvm] (->cl-type tag llvm nil))
+  ([tag llvm content] (->cl-type tag llvm content)))
+
+;; Define types* map cl-type tag -> cl-type
+(def types* (let [int-sizes      [1 8 16 32 64 128]
+                  make-int-type* (fn [width] (eval `(~(symbol (str "LLVM/LLVMInt" width "Type")))))
+                  int-defs       (for [x int-sizes
+                                      :let [tag (keyword (str "i" x))]]
+                                     [tag (make-cl-type tag (make-int-type* x))])
+                  float-defs     {:f (make-cl-type :f (LLVM/LLVMFloatType)) :d (make-cl-type :d (LLVM/LLVMDoubleType))}
+                  defs           (merge int-defs float-defs)]
               (into {} defs)))
 
 (defn throwing-map
@@ -50,13 +66,13 @@
       t
       (throw (Exception. (str "Unknown type " name))))))
 
-;; Clojure type -> LLVM type ref
+;; Clojure type tag -> cl-type
 (def types (throwing-map [types*]))
 
 ;; LLVM type ref -> Clojure type
 (def llvm-types (-> types* clojure.set/map-invert throwing-map))
 
-(defn get-value-type
+(defn llvm-type->cl-type-tag
   "Get type of a llvm value"
   [value]
   (let [value-type (LLVM/LLVMTypeOf value)]
@@ -65,13 +81,7 @@
       LLVM/LLVMDoubleTypeKind  :d
       LLVM/LLVMIntegerTypeKind (keyword (str "i" (LLVM/LLVMGetIntTypeWidth value-type))))))
 
-(get-value-type x)
-
-(LLVM/LLVMIntegerTypeKind)
-
-(llvm-types (get-value-type x))
-
-;; Clojure type -> Java Type
+;; Clojure type tag -> Java Type
 (def c-types {:i1  Boolean
               :i8  Byte
               :i16 Short
@@ -82,13 +92,13 @@
 
 (defn int-type?
   "Is the passed clojure type an integer type?"
-  [type]
-  (boolean (#{:i1 :i8 :i16 :i32 :i64} type)))
+  [{tag :tag}]
+  (boolean (#{:i1 :i8 :i16 :i32 :i64} tag)))
 
 (defn float-type?
   "Is the passed clojure type a floating point type?"
-  [type]
-  (boolean (#{:d :f} type)))
+  [{tag :tag}]
+  (boolean (#{:d :f} tag)))
 
 (defn type-from-meta
   "Reads the metadata of the passed symbol and returns a form which gets
@@ -97,7 +107,9 @@
   (if-let [sym-meta (meta sym)]
     (let [matched-types (filter sym-meta (keys types*))]
       (case (count matched-types)
-        0 (throw (Exception. (str "No type was supplied for the block argument " sym)))
+        0 (if-let [type (:type sym-meta)]
+            (throw (Exception. (str "Explicit meta types aren't supported yet")))
+            (throw (Exception. (str "No type was supplied for the block argument " sym))))
         1 nil
         (throw (Exception. (str "Multiple types supplied for the block argument " sym))))
       `(types ~(first matched-types)))
@@ -106,10 +118,10 @@
 (defn declare-function
   "Forward declare a function"
   [module fn-name ret-type args]
-  `(let [arg-types# ~(vec (map type-from-meta args))
-        arg-types-arr# (into-array LLVMTypeRef arg-types#)
-        ret-type-llvm# (types ~ret-type)
-        func#          (LLVM/LLVMAddFunction ~module ~fn-name (LLVM/LLVMFunctionType ret-type-llvm# (PointerPointer. arg-types-arr#) ~(count args) 0))]
+  `(let [arg-types#     ~(vec (map type-from-meta args))
+         arg-types-arr# (into-array LLVMTypeRef (map :llvm arg-types#))
+         ret-type-llvm#  (:llvm (types ~ret-type))
+         func#           (LLVM/LLVMAddFunction ~module ~fn-name (LLVM/LLVMFunctionType ret-type-llvm# (PointerPointer. arg-types-arr#) ~(count args) 0))]
     (LLVM/LLVMSetFunctionCallConv func# LLVM/LLVMCCallConv)
     {:func func# :args ~(vec (map name args)) :args-types arg-types# :ret ~ret-type :name ~fn-name :module ~module}))
 
@@ -128,7 +140,7 @@
   `(let [block-llvm# (LLVM/LLVMAppendBasicBlock ~'self ~(name (:name block)))]
     (LLVM/LLVMPositionBuilderAtEnd builder block-llvm#)
     (let [phis# ~(into {} (for [arg (:args block)]
-                            `[~(keyword arg) (LLVM/LLVMBuildPhi builder ~(type-from-meta arg) ~(str arg))]))]
+                            `[~(keyword arg) (LLVM/LLVMBuildPhi builder (:llvm ~(type-from-meta arg)) ~(str arg))]))]
       {:name ~(:name block) :llvm block-llvm# :phis phis#})))
 
 (defmacro define-function
@@ -170,14 +182,19 @@
          ~func-info-sym))))
 
 (defn const
-  "Builds a constant value of given type"
+  "Builds a constant value of given type.
+  :type can be cl-type, cl-type-tag or llvm-type"
   [type value]
-  (let [cl-type (if (instance? LLVMTypeRef type) (c-types type) type)
-        llvm-type (types cl-type)]
+  (let [cl-type (cond
+                  (instance? LLVMTypeRef type) (types (llvm-types type))
+                  (instance? cl-type type) type
+                  (keyword? type) (types type))
+        llvm-type (:llvm cl-type)]
     (cond
       (int-type? cl-type) (LLVM/LLVMConstInt llvm-type value 1)
-      (= (float-type?) cl-type) (LLVM/LLVMConstReal llvm-type value)
+      (float-type? cl-type) (LLVM/LLVMConstReal llvm-type value)
       :default (throw (Exception. "Invalid type " type)))))
+
 
 (defn make-llvm-value
   "Helper function to convert vectors of form [:type :value] to llvm values"
@@ -220,7 +237,7 @@
 
 (defn cond-branch
   "Conditionally branch to either block 1 or 2 and give them the provided arguments"
-  [cond block-1  args-1 block-2 args-2]
+  [cond block-1 args-1 block-2 args-2]
   (do
     (bind-phis block-1 args-1)
     (bind-phis block-2 args-2)
@@ -280,12 +297,14 @@
     (LLVM/LLVMBuildICmp builder llvm-op val1 val2 op-name)))
 
 (defllvm store
-  "Builds a store operation")
+  "Builds a store operation"
+  [^:value value ^:value ptr]
+  (LLVM/LLVMBuildStore builder value ptr))
 
 
 (defllvm int-cast
   "Casts value to the given type"
-  [value type] (LLVM/LLVMBuildIntCast builder value type op-name))
+  [^:value value type] (LLVM/LLVMBuildIntCast builder value (:llvm type) op-name))
 
 (defn ret
   "Build ret instruction"
@@ -377,25 +396,27 @@
 
 
 
-;; (def mod (create-module "mod"))
-;; (def fac
-;;   (define-function mod "fac" :i64 [^:i64 x]
-;;     [[:entry
-;;       []
-;;       [break (cmp x [:i64 1] :lt)]
-;;       (cond-branch break [:ret [:i64 1]] [:cont x])]
-;;      [:cont
-;;       [^:i64 y]
-;;       [y-next (sub y [:i64 1])
-;;        res-next (call-func self [y-next])
-;;        res-mul  (mul res-next y)]
-;;       (branch :ret res-mul)]
-;;      [:ret [^:i64 res] [] (ret res)]]))
+(def mod (create-module "mod"))
+(def fac
+  (define-function mod "fac" :i64 [^:i64 x]
+    [[:entry
+      []
+      [break (cmp x [:i64 1] :lt)]
+      (cond-branch break :ret [[:i64 1]] :cont [x])]
+     [:cont
+      [^:i64 y]
+      [y-next (sub y [:i64 1])
+       res-next (call-func self [y-next])
+       res-mul  (mul res-next y)]
+      (branch :ret [res-mul])]
+     [:ret [^:i64 res] [] (ret res)]]))
 
-;; (println (print-module mod))
 
-;; (verify-module mod)
 
-;; (def engine (make-execution-engine mod))
+(println (print-module mod))
 
-;; (run-function engine fac 10)
+(verify-module mod)
+
+(def engine (make-execution-engine mod))
+
+(run-function engine fac [10])
