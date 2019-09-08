@@ -56,6 +56,21 @@
 ;; LLVM type ref -> Clojure type
 (def llvm-types (-> types* clojure.set/map-invert throwing-map))
 
+(defn get-value-type
+  "Get type of a llvm value"
+  [value]
+  (let [value-type (LLVM/LLVMTypeOf value)]
+    (condp = (LLVM/LLVMGetTypeKind value-type)
+      LLVM/LLVMFloatTypeKind   :f
+      LLVM/LLVMDoubleTypeKind  :d
+      LLVM/LLVMIntegerTypeKind (keyword (str "i" (LLVM/LLVMGetIntTypeWidth value-type))))))
+
+(get-value-type x)
+
+(LLVM/LLVMIntegerTypeKind)
+
+(llvm-types (get-value-type x))
+
 ;; Clojure type -> Java Type
 (def c-types {:i1  Boolean
               :i8  Byte
@@ -180,23 +195,7 @@
     (LLVM/LLVMAddIncoming phi (make-llvm-value val) (:llvm current-block) 1)))
 
 
-(defn branch
-  "Branch to the target block (given by keyword) and pass it the arguments"
-  [target args]
-  (let [block-info (target blocks-map)]
-    (bind-phis target args)
-    (LLVM/LLVMBuildBr builder (:llvm block-info))))
-
-
-(defn cond-branch
-  "Conditionally branch to either block 1 or 2 and give them the provided arguments"
-  [cond block-1  args-1 block-2 args-2]
-  (do
-    (bind-phis block-1 args-1)
-    (bind-phis block-2 args-2)
-    (let [get-block-llvm #(:llvm (% blocks-map))]
-      (LLVM/LLVMBuildCondBr builder cond (get-block-llvm block-1) (get-block-llvm block-2)))))
-
+;; ## LLVM Instruction builders
 
 (defmacro defllvm
   "Macro to wrap a llvm function.
@@ -211,6 +210,24 @@
                                     :when (:value (meta arg))]
                                 `[~arg (make-llvm-value ~arg)]))]
           ~body)))))
+
+(defn branch
+  "Branch to the target block (given by keyword) and pass it the arguments"
+  [target args]
+  (let [block-info (target blocks-map)]
+    (bind-phis target args)
+    (LLVM/LLVMBuildBr builder (:llvm block-info))))
+
+(defn cond-branch
+  "Conditionally branch to either block 1 or 2 and give them the provided arguments"
+  [cond block-1  args-1 block-2 args-2]
+  (do
+    (bind-phis block-1 args-1)
+    (bind-phis block-2 args-2)
+    (let [get-block-llvm #(:llvm (% blocks-map))]
+      (LLVM/LLVMBuildCondBr builder cond (get-block-llvm block-1) (get-block-llvm block-2)))))
+
+
 
 (defn make-phi [type name]
   "Builds a phi node"
@@ -261,6 +278,10 @@
                   :ge LLVM/LLVMIntSGE
                   :gt LLVM/LLVMIntSGT)]
     (LLVM/LLVMBuildICmp builder llvm-op val1 val2 op-name)))
+
+(defllvm store
+  "Builds a store operation")
+
 
 (defllvm int-cast
   "Casts value to the given type"
