@@ -20,7 +20,7 @@
   (test-func "Define and execute a simple function"
              "fac" :i32 [^:i32 input]
              [[:entry [] [eq (cmp input [:i32 1] :eq)
-                         res (int-cast eq (types :i32))]
+                          res (int-cast eq :i32)]
                (ret res)]]
              [(is (= 0 (func 0)))
               (is (= -1 (func 1)))]))

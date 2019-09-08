@@ -115,6 +115,15 @@
       `(types ~(first matched-types)))
     (throw (Exception. (str "No type was supplied for the block argument " sym)))))
 
+(defn ensure-cl-type
+  "Take either llvm type, cl type of cl type tag and return a cl type"
+  [type]
+  (cond
+    (instance? LLVMTypeRef type) (make-cl-type (llvm-type->cl-type-tag type) type)
+    (instance? cl-type type) type
+    (keyword? type) (types type)
+    :default (throw (Exception. ("Cannot interpret as type: " type)))))
+
 (defn declare-function
   "Forward declare a function"
   [module fn-name ret-type args]
@@ -196,7 +205,7 @@
       :default (throw (Exception. "Invalid type " type)))))
 
 
-(defn make-llvm-value
+(defn ensure-llvm-value
   "Helper function to convert vectors of form [:type :value] to llvm values"
   [arg]
   (cond
@@ -209,7 +218,7 @@
   "Binds phis for the given block from args"
   [block args]
   (doseq [[phi val] (map vector (vals (:phis (block blocks-map))) args)]
-    (LLVM/LLVMAddIncoming phi (make-llvm-value val) (:llvm current-block) 1)))
+    (LLVM/LLVMAddIncoming phi (ensure-llvm-value val) (:llvm current-block) 1)))
 
 
 ;; ## LLVM Instruction builders
@@ -217,16 +226,18 @@
 (defmacro defllvm
   "Macro to wrap a llvm function.
   For arguments marked as ^:value assures that it is indeed an LLVM value
-  by calling make-llvm-value on them. Also makes the function accept op-name
+  by calling ensure-llvm-value on them. Also makes the function accept op-name
   argument which can be used to name the llvm ir variables"
   ([fn-name args body] `(defllvm ~fn-name "" ~args ~body))
   ([fn-name doc args body]
-   (let [patch-value-sym (gensym)]
-     `(defn ~fn-name ~(str doc) [~@args ~'op-name]
-        (let [~@(apply concat (for [arg   args
-                                    :when (:value (meta arg))]
-                                `[~arg (make-llvm-value ~arg)]))]
-          ~body)))))
+   `(defn ~fn-name ~(str doc) [~@args ~'op-name]
+      (let [~@(apply concat (for [arg args
+                                  :when (:value (meta arg))]
+                              `[~arg (ensure-llvm-value ~arg)]))
+            ~@(apply concat (for [arg args
+                                  :when (:type (meta arg))]
+                              `[~arg (ensure-cl-type ~arg)]))]
+        ~body))))
 
 (defn branch
   "Branch to the target block (given by keyword) and pass it the arguments"
@@ -261,7 +272,7 @@
 (defllvm call-func
   "Calls function with args"
   [func args]
-  (let [llvm-args (map make-llvm-value args)
+  (let [llvm-args (map ensure-llvm-value args)
         args-arr (into-array LLVMValueRef llvm-args)]
     (LLVM/LLVMBuildCall builder func (PointerPointer. args-arr) (count args) op-name)))
 
@@ -304,13 +315,13 @@
 
 (defllvm int-cast
   "Casts value to the given type"
-  [^:value value type] (LLVM/LLVMBuildIntCast builder value (:llvm type) op-name))
+  [^:value value ^:type type] (LLVM/LLVMBuildIntCast builder value (:llvm type) op-name))
 
 (defn ret
   "Build ret instruction"
   ([] (LLVM/LLVMBuildRetVoid builder))
   ([val]
-   (let [llvm-val (make-llvm-value val)]
+   (let [llvm-val (ensure-llvm-value val)]
      (LLVM/LLVMBuildRet builder val))))
 
 (defn get-param
