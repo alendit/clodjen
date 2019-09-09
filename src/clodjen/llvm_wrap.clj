@@ -7,7 +7,8 @@
 ;; parameters to pass to the target block.
 
 (ns clodjen.llvm-wrap
-  (:require [clodjen.utils :refer [extract-arg-meta]]))
+  (:require [clodjen.utils :refer [extract-arg-meta]]
+            [clojure.set :refer [map-invert]]))
 
 (import '[org.bytedeco.javacpp Pointer PointerPointer BytePointer FunctionPointer])
 (import '[org.bytedeco.llvm.LLVM LLVMModuleRef LLVMTypeRef LLVMValueRef
@@ -18,6 +19,10 @@
 
 (require '[clojure.pprint :as pp])
 
+(require '[clojure.spec.alpha :as s])
+(require '[orchestra.spec.test :as st])
+(require '[orchestra.core :refer [defn-spec]])
+
 (defn initialize-jit
   "Initialize LLVM jit internals"
   []
@@ -27,11 +32,17 @@
   (LLVM/LLVMInitializeNativeTarget))
 
 (initialize-jit)
+(st/instrument)
 
-(defn create-module
+(s/def ::llvm-module #(instance? LLVMModuleRef %))
+(s/def ::name string?)
+(s/def ::same ::name)
+(s/def ::module (s/keys :req-un [::name ::llvm-module]))
+
+(defn-spec create-module ::module
   "Create a module with name :name"
-  [name]
-  (LLVM/LLVMModuleCreateWithName name))
+  [name string?]
+  {:name name :llvm-module (LLVM/LLVMModuleCreateWithName name)})
 
 ;; ## Type definitions
 
@@ -41,12 +52,16 @@
 
 ;; Clojure types containing type tag (i.e. :i8, :p, :a), content for complex
 ;; types and reference to the llvm  type
-(defrecord cl-type [tag llvm content])
+(s/def ::tag #{:i1 :i8 :i16 :i32 :i64 :i128 :d :f :p :a :s})
+(s/def ::llvm-type #(instance? LLVMTypeRef %))
+(s/def ::content (constantly true))
+(s/def ::cl-type (s/keys :req-un [::tag ::llvm-type ::content]))
+(defrecord cl-type [tag llvm-type content])
 
-(defn make-cl-type
+(defn-spec make-cl-type ::cl-type
   "Constructor for a cl type"
-  ([tag llvm] (->cl-type tag llvm nil))
-  ([tag llvm content] (->cl-type tag llvm content)))
+  ([tag ::tag llvm ::llvm-type] (->cl-type tag llvm nil))
+  ([tag ::tag llvm ::llvm-type content ::content] (->cl-type tag llvm content)))
 
 ;; Define types* map cl-type tag -> cl-type
 (def types* (let [int-sizes      [1 8 16 32 64 128]
@@ -70,11 +85,13 @@
 (def types (throwing-map [types*]))
 
 ;; LLVM type ref -> Clojure type
-(def llvm-types (-> types* clojure.set/map-invert throwing-map))
+(def llvm-types (-> types* map-invert throwing-map))
 
-(defn llvm-type->cl-type-tag
+(s/def ::llvm-value #(instance? LLVMValueRef %))
+
+(defn-spec llvm-type->cl-type-tag ::tag
   "Get type of a llvm value"
-  [value]
+  [value ::llvm-value]
   (let [value-type (LLVM/LLVMTypeOf value)]
     (condp = (LLVM/LLVMGetTypeKind value-type)
       LLVM/LLVMFloatTypeKind   :f
@@ -90,14 +107,14 @@
               :f   Float
               :d   Double})
 
-(defn int-type?
+(defn-spec int-type? boolean?
   "Is the passed clojure type an integer type?"
-  [{tag :tag}]
+  [{tag :tag} ::cl-type]
   (boolean (#{:i1 :i8 :i16 :i32 :i64} tag)))
 
-(defn float-type?
+(defn-spec float-type? boolean?
   "Is the passed clojure type a floating point type?"
-  [{tag :tag}]
+  [{tag :tag} ::cl-type]
   (boolean (#{:d :f} tag)))
 
 (defn type-from-meta
@@ -115,24 +132,14 @@
       `(types ~(first matched-types)))
     (throw (Exception. (str "No type was supplied for the block argument " sym)))))
 
-(defn ensure-cl-type
+(defn-spec ensure-cl-type ::cl-type
   "Take either llvm type, cl type of cl type tag and return a cl type"
-  [type]
+  [type (s/or :llvm-type ::llvm-type :cl-type ::cl-type :tag ::tag)]
   (cond
     (instance? LLVMTypeRef type) (make-cl-type (llvm-type->cl-type-tag type) type)
     (instance? cl-type type) type
     (keyword? type) (types type)
     :default (throw (Exception. ("Cannot interpret as type: " type)))))
-
-(defn declare-function
-  "Forward declare a function"
-  [module fn-name ret-type args]
-  `(let [arg-types#     ~(vec (map type-from-meta args))
-         arg-types-arr# (into-array LLVMTypeRef (map :llvm arg-types#))
-         ret-type-llvm#  (:llvm (types ~ret-type))
-         func#           (LLVM/LLVMAddFunction ~module ~fn-name (LLVM/LLVMFunctionType ret-type-llvm# (PointerPointer. arg-types-arr#) ~(count args) 0))]
-    (LLVM/LLVMSetFunctionCallConv func# LLVM/LLVMCCallConv)
-    {:func func# :args ~(vec (map name args)) :args-types arg-types# :ret ~ret-type :name ~fn-name :module ~module}))
 
 ;; # Dynamic variable declarations
 ;; The reference to the current LLVMBuilder object
@@ -143,15 +150,39 @@
 ;; The reference to the current block meta information
 (declare ^:dynamic current-block)
 
+(s/def ::llvm-block #(instance? LLVMBasicBlockRef %))
+(s/def ::llvm-phi #(and (instance? LLVMValueRef %1) (LLVM/LLVMIsAPHINode %1)))
+(s/def ::list-llvm-phi (s/coll-of ::llvm-phi))
+(s/def ::block (s/keys :req-un [::name ::llvm-block ::list-llvm-phi]))
 (defn initialize-block
   "Initialize a block and return a map of {:name :llvm :phis}"
   [block]
   `(let [block-llvm# (LLVM/LLVMAppendBasicBlock ~'self ~(name (:name block)))]
     (LLVM/LLVMPositionBuilderAtEnd builder block-llvm#)
     (let [phis# ~(into {} (for [arg (:args block)]
-                            `[~(keyword arg) (LLVM/LLVMBuildPhi builder (:llvm ~(type-from-meta arg)) ~(str arg))]))]
-      {:name ~(:name block) :llvm block-llvm# :phis phis#})))
+                            `[~(keyword arg) (LLVM/LLVMBuildPhi builder (:llvm-type ~(type-from-meta arg)) ~(str arg))]))]
+      {:name ~(:name block) :llvm-block block-llvm# :phis phis#})))
 
+(s/def ::fn-args (s/coll-of symbol?))
+(defn declare-function
+  "Forward declare a function"
+  [module fn-name ret-type args]
+  `(let [arg-types#     ~(vec (map type-from-meta args))
+         arg-types-arr# (into-array LLVMTypeRef (map :llvm-type arg-types#))
+         module-llvm#    (:llvm-module ~module)
+         ret-type-llvm# (:llvm-type (types ~ret-type))
+         func#          (LLVM/LLVMAddFunction module-llvm# ~fn-name (LLVM/LLVMFunctionType ret-type-llvm# (PointerPointer. arg-types-arr#) ~(count args) 0))]
+     (LLVM/LLVMSetFunctionCallConv func# LLVM/LLVMCCallConv)
+     {:llvm-func func# :fn-args ~(vec (map name args)) :fn-arg-types arg-types# :ret ~ret-type :fn-name ~fn-name :module ~module}))
+
+(s/def ::llvm-func (s/and ::llvm-value #(= (LLVM/LLVMGetTypeKind (LLVM/LLVMTypeOf %)) LLVM/LLVMFunctionTypeKind)))
+(s/def ::fn-args (s/coll-of symbol?))
+(s/def ::fn-arg-types (s/coll-of ::cl-type))
+(s/def ::fn-ret-type ::cl-type)
+(s/def ::fn-name string?)
+(s/def ::func (s/keys :req-un [::llvm-func ::fn-args ::fn-arg-types ::fn-ret-type ::fn-name ::module]))
+
+(s/def ::bblock-def (s/coll-of (constantly true)))
 (defmacro define-function
   "Main entry point to define a function
   :fn-name function name
@@ -168,16 +199,16 @@
         block-info-sym (gensym)]
     `(binding [builder (LLVM/LLVMCreateBuilder)]
        (let [~func-info-sym ~(declare-function module fn-name ret-type args)
-             ~'self (:func ~func-info-sym)
+             ~'self (:llvm-func ~func-info-sym)
              ~@(apply concat (map-indexed (fn [index arg] [arg `(get-param ~func-info-sym ~index)]) args))
              ~'blocks-map ~(into {}
                       (for [block blocks]
-                        [(:name block) (initialize-block block)]))]
+                        [(keyword (:name block)) (initialize-block block)]))]
          (binding [blocks-map ~'blocks-map]
            ~@(for [block blocks]
-              `(let [block-name#     ~(keyword (:name block))
+               `(let [block-name#     ~(:name block)
                      ~block-info-sym (block-name# blocks-map)
-                     block-llvm#     (:llvm ~block-info-sym)]
+                     block-llvm#     (:llvm-block ~block-info-sym)]
                  (binding [current-block ~block-info-sym]
                    (LLVM/LLVMPositionBuilderAtEnd builder block-llvm#)
                    (let
@@ -198,7 +229,7 @@
                   (instance? LLVMTypeRef type) (types (llvm-types type))
                   (instance? cl-type type) type
                   (keyword? type) (types type))
-        llvm-type (:llvm cl-type)]
+        llvm-type (:llvm-type cl-type)]
     (cond
       (int-type? cl-type) (LLVM/LLVMConstInt llvm-type value 1)
       (float-type? cl-type) (LLVM/LLVMConstReal llvm-type value)
@@ -218,7 +249,7 @@
   "Binds phis for the given block from args"
   [block args]
   (doseq [[phi val] (map vector (vals (:phis (block blocks-map))) args)]
-    (LLVM/LLVMAddIncoming phi (ensure-llvm-value val) (:llvm current-block) 1)))
+    (LLVM/LLVMAddIncoming phi (ensure-llvm-value val) (:llvm-block current-block) 1)))
 
 
 ;; ## LLVM Instruction builders
@@ -244,7 +275,7 @@
   [target args]
   (let [block-info (target blocks-map)]
     (bind-phis target args)
-    (LLVM/LLVMBuildBr builder (:llvm block-info))))
+    (LLVM/LLVMBuildBr builder (:llvm-block block-info))))
 
 (defn cond-branch
   "Conditionally branch to either block 1 or 2 and give them the provided arguments"
@@ -252,7 +283,7 @@
   (do
     (bind-phis block-1 args-1)
     (bind-phis block-2 args-2)
-    (let [get-block-llvm #(:llvm (% blocks-map))]
+    (let [get-block-llvm #(:llvm-block (% blocks-map))]
       (LLVM/LLVMBuildCondBr builder cond (get-block-llvm block-1) (get-block-llvm block-2)))))
 
 
@@ -315,7 +346,7 @@
 
 (defllvm int-cast
   "Casts value to the given type"
-  [^:value value ^:type type] (LLVM/LLVMBuildIntCast builder value (:llvm type) op-name))
+  [^:value value ^:type type] (LLVM/LLVMBuildIntCast builder value (:llvm-type type) op-name))
 
 (defn ret
   "Build ret instruction"
@@ -326,7 +357,7 @@
 
 (defn get-param
   "Returns function param with index idx"
-  [func idx] (LLVM/LLVMGetParam (:func func) idx))
+  [func idx] (LLVM/LLVMGetParam (:llvm-func func) idx))
 
 (defn get-params
   "Returns a vector with all function params"
@@ -348,33 +379,35 @@
 
 (declare print-module)
 
-(defn verify-module
+(defn-spec verify-module nil?
   "Verify the module and raise an exception on problems"
-  [mod]
+  [mod ::module]
   (let [error (BytePointer. (cast Pointer nil))]
-    (LLVM/LLVMVerifyModule mod LLVM/LLVMPrintMessageAction error)
+    (LLVM/LLVMVerifyModule (:llvm-module mod) LLVM/LLVMPrintMessageAction error)
     (let [error-str (.getString error)]
       (LLVM/LLVMDisposeMessage error)
       (if (not (empty? error-str))
         (throw (Exception. (str "Module verify failed with: " error-str ", in module " (print-module mod))))))))
 
-(defn print-module
+(defn-spec print-module string?
   "Return LLVM IR of the module"
-  [mod]
-  (let [buf (LLVM/LLVMPrintModuleToString mod)
+  [mod ::module]
+  (let [buf (LLVM/LLVMPrintModuleToString (:llvm-module mod))
         s (.getString buf)]
     (LLVM/LLVMDisposeMessage buf)
     s))
 
-(defn make-execution-engine
+(s/def ::engine #(instance? LLVMExecutionEngineRef %))
+
+(defn-spec make-execution-engine ::engine
   "Create an execution engine for the module"
-  ([mod] (make-execution-engine mod true))
-  ([mod verify]
+  ([mod ::module] (make-execution-engine mod true))
+  ([mod ::module verify boolean?]
    (do
      (when verify (verify-module mod))
      (let [engine     (LLVMExecutionEngineRef.)
            error      (BytePointer. (cast Pointer nil))
-           mod-result (LLVM/LLVMCreateJITCompilerForModule engine mod 2 error)]
+           mod-result (LLVM/LLVMCreateJITCompilerForModule engine (:llvm-module mod) 2 error)]
        (if (not= mod-result 0)
          (do
            (println (.getString error))
@@ -394,10 +427,10 @@
      (apply run-function engine func args)))
   ([engine func args]
    {:pre (= (count args) (count (:args func)))}
-   (let [{func-llvm :func
+   (let [{llvm-func :llvm-func
           arg-types :args
           ret-type  :ret
-          func-name :name
+          func-name :fn-name
           func-mod  :module} func
          func-addr          (LLVM/LLVMGetFunctionAddress engine func-name)
          native-func        (com.sun.jna.Function/getFunction (com.sun.jna.Pointer. func-addr) 0 "utf8")
@@ -405,9 +438,10 @@
          exec-res           (.invoke native-func (c-types ret-type) exec-args)]
      exec-res)))
 
-
+(st/instrument)
 
 (def mod (create-module "mod"))
+
 (def fac
   (define-function mod "fac" :i64 [^:i64 x]
     [[:entry
@@ -422,9 +456,7 @@
       (branch :ret [res-mul])]
      [:ret [^:i64 res] [] (ret res)]]))
 
-
-
-(println (print-module mod))
+(print-module mod)
 
 (verify-module mod)
 

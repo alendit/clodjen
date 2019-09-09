@@ -1,5 +1,5 @@
 (ns clodjen.core
-  :require [[clodjen.llvm-wrap :refer :all]]
+  ;; (:require [clodjen.llvm-wrap :refer :all])
   (:gen-class))
 
 (defn -main
