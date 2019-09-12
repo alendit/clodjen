@@ -91,12 +91,11 @@
 
 (defn-spec llvm-type->cl-type-tag ::tag
   "Get type of a llvm value"
-  [value ::llvm-value]
-  (let [value-type (LLVM/LLVMTypeOf value)]
-    (condp = (LLVM/LLVMGetTypeKind value-type)
-      LLVM/LLVMFloatTypeKind   :f
-      LLVM/LLVMDoubleTypeKind  :d
-      LLVM/LLVMIntegerTypeKind (keyword (str "i" (LLVM/LLVMGetIntTypeWidth value-type))))))
+  [value-type ::llvm-type]
+  (condp = (LLVM/LLVMGetTypeKind value-type)
+    LLVM/LLVMFloatTypeKind   :f
+    LLVM/LLVMDoubleTypeKind  :d
+    LLVM/LLVMIntegerTypeKind (keyword (str "i" (LLVM/LLVMGetIntTypeWidth value-type)))))
 
 ;; Clojure type tag -> Java Type
 (def c-types {:i1  Boolean
@@ -140,6 +139,12 @@
     (instance? cl-type type) type
     (keyword? type) (types type)
     :default (throw (Exception. ("Cannot interpret as type: " type)))))
+
+(defn-spec get-raw-type ::llvm-type
+  [type (s/or :llvm-type ::llvm-type :cl-type ::cl-type)]
+  (cond
+    (instance? LLVMTypeRef type) type
+    (instance? cl-type type) (:llvm-type type)))
 
 ;; # Dynamic variable declarations
 ;; The reference to the current LLVMBuilder object
@@ -221,50 +226,69 @@
          `(LLVM/LLVMDisposeBuilder builder)
          ~func-info-sym))))
 
-(defn const
+;; ## LLVM Instruction builders
+
+;; ### LLVM Value handling
+
+(defrecord cl-value [cl-type llvm-value])
+(s/def ::cl-value (s/keys ::cl-type ::llvm-value))
+
+(defn-spec make-llvm-value ::cl-value
+  [cl-type (s/or :tag ::tag :llvm-type ::llvm-type :cl-type ::cl-type)
+   llvm-value ::llvm-value]
+  (->cl-value (ensure-cl-type cl-type) llvm-value))
+
+(defn-spec const ::cl-value
   "Builds a constant value of given type.
   :type can be cl-type, cl-type-tag or llvm-type"
-  [type value]
+  [type any? value any?]
   (let [cl-type (cond
                   (instance? LLVMTypeRef type) (types (llvm-types type))
                   (instance? cl-type type) type
                   (keyword? type) (types type))
-        llvm-type (:llvm-type cl-type)]
-    (cond
-      (int-type? cl-type) (LLVM/LLVMConstInt llvm-type value 1)
-      (float-type? cl-type) (LLVM/LLVMConstReal llvm-type value)
-      :default (throw (Exception. "Invalid type " type)))))
+        llvm-type (:llvm-type cl-type)
+        llvm-value (cond
+                     (int-type? cl-type)   (LLVM/LLVMConstInt llvm-type value 1)
+                     (float-type? cl-type) (LLVM/LLVMConstReal llvm-type value)
+                     :default              (throw (Exception. "Invalid type " type)))]
+    (make-llvm-value cl-type llvm-value)))
 
-
-(defn ensure-llvm-value
+(defn-spec ensure-cl-value ::cl-value
   "Helper function to convert vectors of form [:type :value] to llvm values"
-  [arg]
+  [arg (s/or :cl-value ::cl-value :llvm-value ::llvm-value :literal (s/cat :tag ::tag :const any?))]
   (cond
-    (instance? LLVMValueRef arg)           arg
+    (instance? cl-value arg)               arg
+    (instance? LLVMValueRef arg)           (make-llvm-value (LLVM/LLVMTypeOf arg) arg)
     (and (seqable? arg) (= 2 (count arg))) (apply const arg)
     :default                               (throw (Exception. (str "Value arg " arg " should be either LLVMValueRef or a (type const) tuple")))))
+
+(defn-spec get-raw-value ::llvm-value
+  "Get raw llvm value either from a cl-value or from an llvm-value"
+  [llvm-value (s/or ::llvm-value ::cl-value)]
+  (cond
+    (instance? LLVMValueRef llvm-value) llvm-value
+    (instance? cl-value llvm-value) (:llvm-value llvm-value)
+    :default (throw (Exception. "Either supply a cl-value of an llvm-value"))))
 
 
 (defn bind-phis
   "Binds phis for the given block from args"
   [block args]
   (doseq [[phi val] (map vector (vals (:phis (block blocks-map))) args)]
-    (LLVM/LLVMAddIncoming phi (ensure-llvm-value val) (:llvm-block current-block) 1)))
+    (LLVM/LLVMAddIncoming phi (-> val ensure-cl-value get-raw-value) (:llvm-block current-block) 1)))
 
-
-;; ## LLVM Instruction builders
 
 (defmacro defllvm
   "Macro to wrap a llvm function.
   For arguments marked as ^:value assures that it is indeed an LLVM value
-  by calling ensure-llvm-value on them. Also makes the function accept op-name
+  by calling ensure-cl-value on them. Also makes the function accept op-name
   argument which can be used to name the llvm ir variables"
   ([fn-name args body] `(defllvm ~fn-name "" ~args ~body))
   ([fn-name doc args body]
    `(defn ~fn-name ~(str doc) [~@args ~'op-name]
       (let [~@(apply concat (for [arg args
                                   :when (:value (meta arg))]
-                              `[~arg (ensure-llvm-value ~arg)]))
+                              `[~arg (ensure-cl-value ~arg)]))
             ~@(apply concat (for [arg args
                                   :when (:type (meta arg))]
                               `[~arg (ensure-cl-type ~arg)]))]
@@ -286,46 +310,44 @@
     (let [get-block-llvm #(:llvm-block (% blocks-map))]
       (LLVM/LLVMBuildCondBr builder cond (get-block-llvm block-1) (get-block-llvm block-2)))))
 
-
-
 (defn make-phi [type name]
   "Builds a phi node"
-  (LLVM/LLVMBuildPhi builder type name))
+  (LLVM/LLVMBuildPhi builder (get-raw-type type) name))
 
 (defn phi-incoming
   "Binds incoming values to phi"
   [phi values blocks]
   {:pre (= (count values) (count blocks))}
-  (let [values-arr (into-array LLVMValueRef values)
+  (let [values-arr (->> values (map get-raw-value) (into-array LLVMValueRef))
         block-arr (into-array LLVMBasicBlockRef blocks)]
     (LLVM/LLVMAddIncoming phi (PointerPointer. values-arr) (PointerPointer. block-arr) (count values))))
 
 (defllvm call-func
   "Calls function with args"
   [func args]
-  (let [llvm-args (map ensure-llvm-value args)
+  (let [llvm-args (map (comp get-raw-value ensure-cl-value) args)
         args-arr (into-array LLVMValueRef llvm-args)]
     (LLVM/LLVMBuildCall builder func (PointerPointer. args-arr) (count args) op-name)))
 
 (defllvm mul
   "Builds multiplication"
   [^:value val1 ^:value val2]
-  (LLVM/LLVMBuildMul builder val1 val2 op-name))
+  (LLVM/LLVMBuildMul builder (get-raw-value val1) (get-raw-value val2) op-name))
 
 (defllvm add
   "Builds addition"
   [^:value val1 ^:value val2]
-  (LLVM/LLVMBuildAdd builder val1 val2 op-name))
+  (LLVM/LLVMBuildAdd builder (get-raw-value val1) (get-raw-value val2) op-name))
 
 (defllvm sub
   "Builds subtraction"
   [^:value val1 ^:value val2]
-  (LLVM/LLVMBuildSub builder val1 val2 op-name))
+  (LLVM/LLVMBuildSub builder (get-raw-value val1) (get-raw-value val2) op-name))
 
 (defllvm fdiv
   "Builds float division"
   [^:value val1 ^:value val2]
-  (LLVM/LLVMBuildFDiv builder val1 val2 op-name))
+  (LLVM/LLVMBuildFDiv builder (get-raw-value val1) (get-raw-value val2) op-name))
 
 (defllvm cmp
   "Builds comparison between two values. op gives the comparison type"
@@ -336,23 +358,23 @@
                   :le LLVM/LLVMIntSLE
                   :ge LLVM/LLVMIntSGE
                   :gt LLVM/LLVMIntSGT)]
-    (LLVM/LLVMBuildICmp builder llvm-op val1 val2 op-name)))
+    (LLVM/LLVMBuildICmp builder llvm-op (get-raw-value val1) (get-raw-value val2) op-name)))
 
 (defllvm store
   "Builds a store operation"
   [^:value value ^:value ptr]
-  (LLVM/LLVMBuildStore builder value ptr))
+  (LLVM/LLVMBuildStore builder (get-raw-value value) ptr))
 
 
 (defllvm int-cast
   "Casts value to the given type"
-  [^:value value ^:type type] (LLVM/LLVMBuildIntCast builder value (:llvm-type type) op-name))
+  [^:value value ^:type type] (LLVM/LLVMBuildIntCast builder (get-raw-value value) (get-raw-type type) op-name))
 
 (defn ret
   "Build ret instruction"
   ([] (LLVM/LLVMBuildRetVoid builder))
   ([val]
-   (let [llvm-val (ensure-llvm-value val)]
+   (let [llvm-val (get-raw-value val)]
      (LLVM/LLVMBuildRet builder val))))
 
 (defn get-param
@@ -456,7 +478,7 @@
       (branch :ret [res-mul])]
      [:ret [^:i64 res] [] (ret res)]]))
 
-(print-module mod)
+(println (print-module mod))
 
 (verify-module mod)
 
